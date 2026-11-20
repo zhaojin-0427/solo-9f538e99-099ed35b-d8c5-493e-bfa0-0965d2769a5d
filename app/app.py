@@ -171,6 +171,14 @@ def create_app(database_path: str | None = None) -> Flask:
                 "已处理的内容已保留。"
             )
             return render_template("draft.html", **view), 422
+        except core.MissingRegions as exc:
+            bundle = core.load_bundle(conn, draft_id)
+            view = _draft_view(conn, bundle)
+            view["error"] = (
+                f"无法发布：{exc}。"
+                "请在原片 WebVTT 中补齐 REGION 定义后重新上传建立草稿。"
+            )
+            return render_template("draft.html", **view), 422
         flash(f"已发布第 {version_no} 版。", "ok")
         return redirect(url_for("edition_detail", version_no=version_no))
 
@@ -199,6 +207,33 @@ def create_app(database_path: str | None = None) -> Flask:
             mimetype="text/vtt",
             as_attachment=True,
             download_name=f"oral-history-v{version_no}.vtt",
+            max_age=0,
+        )
+
+    @app.post("/editions/<int:version_no>/repair")
+    def repair_layout(version_no: int):
+        conn = get_db()
+        if core.get_edition(conn, version_no) is None:
+            abort(404)
+        try:
+            core.repair_edition(conn, version_no)
+        except core.RepairError as exc:
+            flash(f"无法生成修复件：{exc}", "error")
+        else:
+            flash("已生成布局修复件，可单独下载；原下载地址仍返回原件。", "ok")
+        return redirect(url_for("edition_detail", version_no=version_no))
+
+    @app.get("/editions/<int:version_no>/repaired")
+    def download_repaired(version_no: int):
+        conn = get_db()
+        edition = core.get_edition(conn, version_no)
+        if edition is None or edition["repaired_blob"] is None:
+            abort(404)
+        return send_file(
+            io.BytesIO(edition["repaired_blob"]),
+            mimetype="text/vtt",
+            as_attachment=True,
+            download_name=f"oral-history-v{version_no}-repaired.vtt",
             max_age=0,
         )
 
@@ -264,6 +299,7 @@ def _draft_view(conn, bundle: dict) -> dict:
     row = bundle["row"]
     fragments = bundle["fragments"]
     decisions = bundle["decisions"]
+    regions = bundle["regions"]
 
     previous = conn.execute(
         "SELECT id FROM draft WHERE id < ? ORDER BY id DESC LIMIT 1", (row["id"],)
@@ -274,11 +310,20 @@ def _draft_view(conn, bundle: dict) -> dict:
 
     cards = []
     occurrence_index = -1
+    missing_count = 0
     for fragment in fragments:
         frag_cards = []
         for occ in fragment.occurrences:
             occurrence_index += 1
             decision = decisions.get(occ.signature)
+            missing_regions = [
+                region_id
+                for region_id in core.region_refs(occ.settings)
+                if region_id not in regions
+            ]
+            if missing_regions and core.decision_text(occ, decisions) is not None:
+                # 会进入成品却缺少 REGION 定义的出现：发布会被拒绝。
+                missing_count += 1
             frag_cards.append(
                 {
                     "index": occurrence_index,
@@ -287,6 +332,7 @@ def _draft_view(conn, bundle: dict) -> dict:
                     "inherited": occ.kind == core.CUT
                     and occ.signature in previous_decisions,
                     "pending": core.is_pending(occ, decisions),
+                    "missing_regions": missing_regions,
                 }
             )
         cards.append({"fragment": fragment, "occurrences": frag_cards})
@@ -296,6 +342,7 @@ def _draft_view(conn, bundle: dict) -> dict:
         "row": row,
         "cards": cards,
         "pending_count": len(pending),
+        "missing_count": missing_count,
         "fragment_count": len(fragments),
         "occurrence_count": len(bundle["occurrences"]),
         "cut_count": sum(1 for occ in bundle["occurrences"] if occ.kind == core.CUT),

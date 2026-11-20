@@ -12,6 +12,23 @@
   <p><a class="button primary" href="{{ url_for('download', version_no=edition.version_no) }}">下载完整 WebVTT</a></p>
 </section>
 <section class="panel">
+  <h2>布局修复件</h2>
+  <p class="hint">
+    两人同时说话时，旧版成品可能丢失原片的字幕分区（REGION）与时间行设置。
+    修复件按该版发布时的源草稿重算布局，并与原件逐条核对（条数、节选起止、正文一致）后才生成；
+    每版只留一份，清理源草稿或重启后下载字节不变。原下载地址始终返回原件。
+  </p>
+  {% if edition.repaired_blob %}
+  <p class="hint">已生成 · {{ edition.repaired_at }}</p>
+  <p class="hint mono">修复件 SHA-256 {{ edition.repaired_sha256 }}</p>
+  <p><a class="button" href="{{ url_for('download_repaired', version_no=edition.version_no) }}">下载布局修复件</a></p>
+  {% else %}
+  <form method="post" action="{{ url_for('repair_layout', version_no=edition.version_no) }}">
+    <button type="submit" class="primary">按源草稿重算并生成修复件</button>
+  </form>
+  {% endif %}
+</section>
+<section class="panel">
   <h2>文件内容</h2>
   <pre class="vtt">{{ body }}</pre>
 </section>

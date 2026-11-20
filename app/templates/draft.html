@@ -18,6 +18,7 @@
     <div><dt>出现</dt><dd>{{ occurrence_count }}</dd></div>
     <div><dt>剪口字幕</dt><dd>{{ cut_count }}</dd></div>
     <div><dt>待处理</dt><dd class="{{ 'warn' if pending_count else 'ok' }}">{{ pending_count }}</dd></div>
+    <div><dt>缺 REGION 定义</dt><dd class="{{ 'warn' if missing_count else 'ok' }}">{{ missing_count }}</dd></div>
     <div><dt>节选总长</dt><dd>{{ total_ms | ts }}</dd></div>
   </dl>
   <p class="hint">
@@ -26,6 +27,8 @@
   </p>
   <p class="hint">
     整条保留的字幕沿用正文；剪口截断的字幕须逐次录入保留文字，或标为删除。全部处理完才能发布。
+    发布时保留每条原字幕的时间行设置（region、line 等），成品只收录实际引用的 REGION 定义；
+    引用了未定义 REGION 的字幕会在下方标明，补齐定义前不能发布。
   </p>
 </section>
 
@@ -58,10 +61,16 @@
         <span class="cue-no">原字幕 #{{ occ.cue_index + 1 }}</span>
         <span class="pair"><small>原片</small> {{ occ.ov_start | ts }} – {{ occ.ov_end | ts }}</span>
         <span class="pair"><small>节选</small> {{ occ.out_start | ts }} – {{ occ.out_end | ts }}</span>
+        <span class="pair"><small>时间行设置</small>
+          {% if occ.settings %}<code class="mono">{{ occ.settings }}</code>{% else %}（无）{% endif %}
+        </span>
         {% if item.cut_start %}<span class="chip">起端截断</span>{% endif %}
         {% if item.cut_end %}<span class="chip">末端截断</span>{% endif %}
         {% if item.inherited %}<span class="chip inherited">沿用上一版校订</span>{% endif %}
         {% if item.pending %}<span class="chip pending">待处理</span>{% endif %}
+        {% if item.missing_regions %}
+        <span class="chip missing">缺少 REGION 定义：{{ item.missing_regions | join('、') }}</span>
+        {% endif %}
       </div>
 
       <blockquote class="original">{{ occ.text }}</blockquote>
@@ -93,8 +102,8 @@
     <button type="submit" class="primary" formaction="{{ url_for('save', draft_id=row.id) }}" {{ 'disabled' if stale }}>
       保存校订
     </button>
-    <button type="submit" class="primary publish" formaction="{{ url_for('publish', draft_id=row.id) }}" {{ 'disabled' if stale or pending_count }}>
-      发布{% if pending_count %}（还有 {{ pending_count }} 处未处理）{% endif %}
+    <button type="submit" class="primary publish" formaction="{{ url_for('publish', draft_id=row.id) }}" {{ 'disabled' if stale or pending_count or missing_count }}>
+      发布{% if pending_count %}（还有 {{ pending_count }} 处未处理）{% elif missing_count %}（有 {{ missing_count }} 处缺少 REGION 定义）{% endif %}
     </button>
   </div>
 </form>

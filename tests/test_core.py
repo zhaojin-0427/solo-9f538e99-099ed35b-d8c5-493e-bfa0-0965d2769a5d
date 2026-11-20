@@ -235,3 +235,97 @@ class TestInheritance:
         previous = {old_occ.signature: {"status": "keep", "text": "旧校订"}}
         assert core.inherited_decisions(new, previous) == {}
         assert new_occ.signature != old_occ.signature
+
+
+REGION_VTT = (
+    "WEBVTT\n\n"
+    "REGION\nid:upper\nlines:2\nviewportanchor:50%,0%\n\n"
+    "REGION\nid:lower\nlines:2\n\n"
+    "REGION\nid:unused\nlines:1\n\n"
+    "1\n00:00:01.000 --> 00:00:05.000 region:upper line:10%\n甲说的话。\n\n"
+    "2\n00:00:02.000 --> 00:00:06.000 region:lower line:90%\n乙同时说的话。\n\n"
+    "3\n00:00:07.000 --> 00:00:09.000\n没有设置的一句。\n"
+)
+
+
+class TestRegions:
+    def test_parse_regions_keeps_block_lines(self):
+        regions = core.parse_regions(REGION_VTT)
+        assert set(regions) == {"upper", "lower", "unused"}
+        assert regions["upper"][0] == "REGION"
+        assert regions["upper"][1] == "id:upper"
+        assert "viewportanchor:50%,0%" in regions["upper"]
+
+    def test_region_without_id_is_ignored(self):
+        raw = "WEBVTT\n\nREGION\nlines:3\n\n1\n00:00:01.000 --> 00:00:02.000\n甲。\n"
+        assert core.parse_regions(raw) == {}
+
+    def test_region_refs_from_settings(self):
+        assert core.region_refs("region:upper line:10%") == ["upper"]
+        assert core.region_refs("line:10% region:lower region:lower") == ["lower"]
+        assert core.region_refs("") == []
+        assert core.region_refs("line:10%") == []
+
+    def test_build_vtt_with_settings_and_region_blocks(self):
+        body = core.build_vtt(
+            [(0, 1500, "region:upper line:10%", ["甲"]), (1500, 3000, ["乙"])],
+            [["REGION", "id:upper", "lines:2"]],
+        )
+        lines = body.splitlines()
+        assert lines[0] == "WEBVTT"
+        assert lines[2:5] == ["REGION", "id:upper", "lines:2"]
+        assert "00:00:00.000 --> 00:00:01.500 region:upper line:10%" in body
+        assert "00:00:01.500 --> 00:00:03.000\n乙" in body
+
+    def test_occurrence_carries_its_own_cue_settings(self):
+        parsed = core.parse_vtt(REGION_VTT)
+        frags = core.compute_occurrences(cuts([("A", 0, 10_000)]), parsed)
+        occs = core.flatten(frags)
+        # 同一时刻的两条字幕各自带上对应原字幕的设置
+        assert occs[0].settings == "region:upper line:10%"
+        assert occs[1].settings == "region:lower line:90%"
+        assert occs[2].settings == ""
+
+    def test_same_time_same_text_cues_keep_own_settings(self):
+        raw = (
+            "WEBVTT\n\n"
+            "1\n00:00:01.000 --> 00:00:03.000 region:upper\n同一句话。\n\n"
+            "2\n00:00:01.000 --> 00:00:03.000 region:lower\n同一句话。\n"
+        )
+        parsed = core.parse_vtt(raw)
+        frags = core.compute_occurrences(cuts([("A", 0, 10_000)]), parsed)
+        occs = core.flatten(frags)
+        assert [occ.settings for occ in occs] == ["region:upper", "region:lower"]
+        out = core.build_output(frags, {}, core.parse_regions(raw))
+        assert "00:00:01.000 --> 00:00:03.000 region:upper" in out
+        assert "00:00:01.000 --> 00:00:03.000 region:lower" in out
+
+    def test_output_keeps_settings_and_only_referenced_regions(self):
+        parsed = core.parse_vtt(REGION_VTT)
+        frags = core.compute_occurrences(cuts([("A", 0, 10_000)]), parsed)
+        out = core.build_output(frags, {}, core.parse_regions(REGION_VTT))
+        assert "00:00:01.000 --> 00:00:05.000 region:upper line:10%" in out
+        assert "00:00:02.000 --> 00:00:06.000 region:lower line:90%" in out
+        assert "id:upper" in out and "id:lower" in out
+        # 未被引用的 REGION 定义不收录
+        assert "id:unused" not in out
+        # REGION 块排在字幕之前
+        assert out.index("REGION") < out.index("-->")
+
+    def test_missing_region_occurrences_only_for_output(self):
+        raw = (
+            "WEBVTT\n\n"
+            "1\n00:00:01.000 --> 00:00:05.000 region:ghost\n甲。\n\n"
+            "2\n00:00:06.000 --> 00:00:08.000\n乙。\n"
+        )
+        parsed = core.parse_vtt(raw)
+        frags = core.compute_occurrences(cuts([("A", 0, 10_000)]), parsed)
+        missing = core.missing_region_occurrences(frags, {}, {})
+        assert len(missing) == 1
+        occ, refs = missing[0]
+        assert occ.cue_index == 0
+        assert refs == ["ghost"]
+        # 没有缺失定义时为空
+        assert core.missing_region_occurrences(
+            frags, {}, {"ghost": ["REGION", "id:ghost"]}
+        ) == []

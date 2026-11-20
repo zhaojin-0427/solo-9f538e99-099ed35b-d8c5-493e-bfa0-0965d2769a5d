@@ -114,6 +114,7 @@ th, td { text-align: left; padding: .45rem .4rem; border-bottom: 1px solid var(-
 .chip { padding: .05rem .45rem; border-radius: 3px; background: #eef0f3; color: var(--muted); font-size: .75rem; }
 .chip.pending { background: #ffe9cc; color: var(--warn); }
 .chip.inherited { background: #e8eefb; color: #35509b; }
+.chip.missing { background: #fbe8e8; color: var(--error); }
 
 blockquote.original {
   margin: .4rem 0;

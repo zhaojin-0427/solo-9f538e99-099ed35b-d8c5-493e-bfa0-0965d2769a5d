@@ -1,6 +1,7 @@
 """网页流程测试：上传、预览、校订、发布、下载、过期页与失败原子性。"""
 from __future__ import annotations
 
+import hashlib
 import re
 
 import pytest
@@ -344,3 +345,257 @@ class TestPersistence:
             assert core.get_edition(conn, 1) is None
         finally:
             conn.close()
+
+
+# 两人同时说话：重叠字幕 + REGION 分区 + 时间行设置
+VTT_OVERLAP = """WEBVTT
+
+REGION
+id:upper
+lines:2
+viewportanchor:50%,0%
+
+REGION
+id:lower
+lines:2
+
+REGION
+id:unused
+lines:1
+
+1
+00:00:01.000 --> 00:00:05.000 region:upper line:10%
+第一句原话。
+
+2
+00:00:03.000 --> 00:00:07.000 region:lower line:90%
+重叠的第二句。
+
+3
+00:00:08.000 --> 00:00:12.000
+第三句原话。
+"""
+
+# 引用 upper 但没有它的 REGION 定义
+VTT_GHOST = """WEBVTT
+
+REGION
+id:lower
+lines:2
+
+1
+00:00:01.000 --> 00:00:05.000 region:upper line:10%
+第一句原话。
+
+2
+00:00:03.000 --> 00:00:07.000 region:lower line:90%
+重叠的第二句。
+
+3
+00:00:08.000 --> 00:00:12.000
+第三句原话。
+"""
+
+CSV_OVERLAP = """片段号,原片起毫秒,原片止毫秒
+A,00:00:01.500,00:00:12.000
+"""
+
+
+@pytest.fixture()
+def app_db(tmp_path):
+    db = str(tmp_path / "layout.db")
+    application = create_app(db)
+    application.config.update(TESTING=True)
+    return application, db
+
+
+def publish_overlap(client, vtt=VTT_OVERLAP):
+    """上传重叠字幕并发布：cue1 起端被截，按 keep 处理。"""
+    draft_id = upload(client, vtt=vtt, csv=CSV_OVERLAP)
+    response = fill(
+        client, draft_id, lambda index: ("keep", "第一句的保留文字"), publish=True
+    )
+    assert response.status_code == 302, response.data.decode()
+    return draft_id
+
+
+def make_legacy_edition(client, db):
+    """模拟布局丢失的旧版：发布后把成品换成剥掉设置与 REGION 的字节。"""
+    publish_overlap(client)
+    conn = core.connect(db)
+    try:
+        edition = core.get_edition(conn, 1)
+        cues = core.parse_vtt(edition["vtt_blob"].decode("utf-8"))
+        stripped = core.build_vtt(
+            [(cue.start_ms, cue.end_ms, cue.text.split("\n")) for cue in cues]
+        )
+        blob = stripped.encode("utf-8")
+        conn.execute(
+            "UPDATE edition SET vtt_blob = ?, vtt_sha256 = ? WHERE version_no = 1",
+            (blob, hashlib.sha256(blob).hexdigest()),
+        )
+    finally:
+        conn.close()
+    return stripped
+
+
+class TestLayoutPreservation:
+    def test_publish_keeps_settings_and_referenced_regions(self, client):
+        publish_overlap(client)
+        body = client.get("/editions/1/download").data.decode()
+        # 每条字幕保留对应原字幕的时间行设置（剪口校订的那条也一样）
+        assert "00:00:00.000 --> 00:00:03.500 region:upper line:10%" in body
+        assert "00:00:01.500 --> 00:00:05.500 region:lower line:90%" in body
+        # 成品只收录实际引用的 REGION 定义
+        assert "id:upper" in body and "id:lower" in body
+        assert "id:unused" not in body
+        # REGION 块排在字幕之前
+        assert body.index("REGION") < body.index("-->")
+        # 原件正文不受影响
+        parsed = core.parse_vtt(body)
+        assert [cue.text for cue in parsed] == [
+            "第一句的保留文字",
+            "重叠的第二句。",
+            "第三句原话。",
+        ]
+
+    def test_draft_page_shows_occurrence_settings(self, client):
+        draft_id = upload(client, vtt=VTT_OVERLAP, csv=CSV_OVERLAP)
+        html = draft_form(client, draft_id)[2]
+        assert "时间行设置" in html
+        assert "region:upper line:10%" in html
+        assert "region:lower line:90%" in html
+
+    def test_missing_region_marked_and_publish_rejected(self, client):
+        draft_id = upload(client, vtt=VTT_GHOST, csv=CSV_OVERLAP)
+        html = draft_form(client, draft_id)[2]
+        # 在对应字幕旁标明缺少的定义
+        assert "缺少 REGION 定义：upper" in html
+        # 直接提交发布也被拒绝，且不留新版本
+        response = fill(
+            client, draft_id, lambda index: ("keep", "保留文字"), publish=True
+        )
+        assert response.status_code == 422
+        assert "未定义的 REGION" in response.data.decode()
+        assert client.get("/editions").data.decode().count("下载 WebVTT") == 0
+
+    def test_deleted_occurrence_with_missing_region_can_publish(self, client):
+        draft_id = upload(client, vtt=VTT_GHOST, csv=CSV_OVERLAP)
+        # 引用缺失定义的那次出现被标为删除：不进入成品，不再阻止发布
+        response = fill(client, draft_id, lambda index: ("delete", ""), publish=True)
+        assert response.status_code == 302
+        body = client.get("/editions/1/download").data.decode()
+        assert "id:lower" in body
+        assert "region:upper" not in body
+
+
+class TestLayoutRepair:
+    def test_repair_restores_layout_and_keeps_original(self, app_db):
+        application, db = app_db
+        client = application.test_client()
+        legacy = make_legacy_edition(client, db)
+        assert "REGION" not in legacy and "region:upper" not in legacy
+        original_sha = hashlib.sha256(legacy.encode("utf-8")).hexdigest()
+
+        # 详情页保留原 SHA-256
+        detail = client.get("/editions/1").data.decode()
+        assert original_sha in detail
+
+        response = client.post("/editions/1/repair", follow_redirects=False)
+        assert response.status_code == 302
+
+        repaired = client.get("/editions/1/repaired")
+        assert repaired.status_code == 200
+        body = repaired.data.decode()
+        assert "id:upper" in body and "id:lower" in body
+        assert "id:unused" not in body
+        assert "00:00:00.000 --> 00:00:03.500 region:upper line:10%" in body
+
+        # 原下载地址仍返回原件，详情页仍显示原 SHA-256
+        assert client.get("/editions/1/download").data.decode() == legacy
+        detail = client.get("/editions/1").data.decode()
+        assert original_sha in detail
+        assert hashlib.sha256(repaired.data).hexdigest() in detail
+
+    def test_repair_once_survives_cleanup_and_restart(self, tmp_path):
+        db = str(tmp_path / "repair.db")
+        application = create_app(db)
+        application.config.update(TESTING=True)
+        client = application.test_client()
+        make_legacy_edition(client, db)
+
+        client.post("/editions/1/repair")
+        first = client.get("/editions/1/repaired").data
+        # 重复修复：每版只留一份，字节不变
+        client.post("/editions/1/repair")
+        assert client.get("/editions/1/repaired").data == first
+
+        # 清理源草稿（校订级联删除）后仍能下载相同字节
+        conn = core.connect(db)
+        try:
+            conn.execute("DELETE FROM draft")
+        finally:
+            conn.close()
+        assert client.get("/editions/1/repaired").data == first
+
+        # 重启后仍能下载相同字节
+        restarted = create_app(db)
+        restarted.config.update(TESTING=True)
+        again = restarted.test_client().get("/editions/1/repaired")
+        assert again.status_code == 200
+        assert again.data == first
+
+    def test_repair_fails_when_source_draft_missing(self, app_db):
+        application, db = app_db
+        client = application.test_client()
+        make_legacy_edition(client, db)
+        conn = core.connect(db)
+        try:
+            conn.execute("DELETE FROM draft")
+        finally:
+            conn.close()
+
+        response = client.post("/editions/1/repair", follow_redirects=True)
+        assert "源草稿" in response.data.decode()
+        assert client.get("/editions/1/repaired").status_code == 404
+        # 不留下修复件
+        conn = core.connect(db)
+        try:
+            assert core.get_edition(conn, 1)["repaired_blob"] is None
+        finally:
+            conn.close()
+
+    def test_repair_fails_when_text_mismatches(self, app_db):
+        application, db = app_db
+        client = application.test_client()
+        make_legacy_edition(client, db)
+        # 篡改源草稿的校订：重算正文与原件对不上
+        conn = core.connect(db)
+        try:
+            conn.execute(
+                "UPDATE decision SET text = '被篡改的保留文字' WHERE status = 'keep'"
+            )
+        finally:
+            conn.close()
+
+        response = client.post("/editions/1/repair", follow_redirects=True)
+        assert "核对不符" in response.data.decode()
+        assert client.get("/editions/1/repaired").status_code == 404
+
+    def test_repair_fails_when_count_mismatches(self, app_db):
+        application, db = app_db
+        client = application.test_client()
+        make_legacy_edition(client, db)
+        # 把校订改成删除：重算条数少于原件
+        conn = core.connect(db)
+        try:
+            conn.execute(
+                "UPDATE decision SET status = 'delete', text = '' "
+                "WHERE status = 'keep'"
+            )
+        finally:
+            conn.close()
+
+        response = client.post("/editions/1/repair", follow_redirects=True)
+        assert "条数不同" in response.data.decode()
+        assert client.get("/editions/1/repaired").status_code == 404

@@ -41,6 +41,21 @@ class PublishBlocked(RuntimeError):
         self.pending = pending
 
 
+class MissingRegions(RuntimeError):
+    """成品字幕引用了原片中未定义的 REGION，拒绝发布。"""
+
+    def __init__(self, missing: list[tuple["Occurrence", list[str]]]):
+        self.missing = missing
+        ids = sorted({region_id for _, refs in missing for region_id in refs})
+        super().__init__(
+            f"{len(missing)} 处字幕引用了未定义的 REGION：{'、'.join(ids)}"
+        )
+
+
+class RepairError(RuntimeError):
+    """修复件首次生成失败：来源缺失、核对不符或生成失败。"""
+
+
 def parse_timestamp(value: str) -> int:
     """把时码解析为毫秒。接受 HH:MM:SS.mmm、MM:SS.mmm、HH:MM:SS,mmm 与纯毫秒。"""
     if value is None:
@@ -107,8 +122,8 @@ def _clean_text_lines(lines: Iterable[str]) -> str:
     return "\n".join(line.rstrip() for line in lines).strip("\n")
 
 
-def parse_vtt(data: str) -> list[Cue]:
-    """解析 WebVTT 原文。字幕正文按行保留，多行以换行连接。"""
+def _vtt_blocks(data: str) -> list[list[str]]:
+    """把 WebVTT 原文切成块（空行分隔），WEBVTT 行与文件头元数据已跳过。"""
     lines = _normalise_newlines(data).split("\n")
     if not lines or not lines[0].startswith("WEBVTT"):
         raise ParseError("不是 WebVTT 文件：缺少 WEBVTT 文件头")
@@ -131,9 +146,13 @@ def parse_vtt(data: str) -> list[Cue]:
             current.append(line)
     if current:
         blocks.append(current)
+    return blocks
 
+
+def parse_vtt(data: str) -> list[Cue]:
+    """解析 WebVTT 原文。字幕正文按行保留，多行以换行连接。"""
     cues: list[Cue] = []
-    for block in blocks:
+    for block in _vtt_blocks(data):
         first = block[0].strip()
         if first.startswith(("NOTE", "STYLE", "REGION")):
             continue
@@ -174,11 +193,60 @@ def parse_vtt(data: str) -> list[Cue]:
     return cues
 
 
-def build_vtt(entries: Iterable[tuple[int, int, list[str]]]) -> str:
-    """把 (起, 止, 文本行) 拼成完整 WebVTT 文件。"""
+def parse_regions(data: str) -> dict[str, list[str]]:
+    """提取原片中的 REGION 定义：{region id: 完整块文本行（含 REGION 首行）}。
+
+    没有 id 的 REGION 块无法被字幕引用，直接忽略。
+    """
+    regions: dict[str, list[str]] = {}
+    for block in _vtt_blocks(data):
+        if block[0].strip() != "REGION":
+            continue
+        region_id = ""
+        for line in block[1:]:
+            stripped = line.strip()
+            if stripped.startswith("id:"):
+                region_id = stripped[len("id:") :].strip()
+                break
+        if region_id and region_id not in regions:
+            regions[region_id] = [line.rstrip() for line in block]
+    return regions
+
+
+def region_refs(settings: str) -> list[str]:
+    """时间行设置中引用的 REGION id（按出现顺序去重）。"""
+    refs: list[str] = []
+    for token in settings.split():
+        if token.startswith("region:") and len(token) > len("region:"):
+            region_id = token[len("region:") :]
+            if region_id not in refs:
+                refs.append(region_id)
+    return refs
+
+
+def build_vtt(
+    entries: Iterable[tuple],
+    region_blocks: Iterable[list[str]] = (),
+) -> str:
+    """把字幕条目拼成完整 WebVTT 文件。
+
+    条目为 (起, 止, 文本行) 或 (起, 止, 时间行设置, 文本行)；
+    region_blocks 为输出字幕实际引用的 REGION 定义块，原样排在字幕之前。
+    """
     out = ["WEBVTT", ""]
-    for start_ms, end_ms, text_lines in entries:
-        out.append(f"{format_timestamp(start_ms)} --> {format_timestamp(end_ms)}")
+    for block in region_blocks:
+        out.extend(block)
+        out.append("")
+    for entry in entries:
+        if len(entry) == 3:
+            start_ms, end_ms, text_lines = entry
+            settings = ""
+        else:
+            start_ms, end_ms, settings, text_lines = entry
+        timing = f"{format_timestamp(start_ms)} --> {format_timestamp(end_ms)}"
+        if settings:
+            timing = f"{timing} {settings}"
+        out.append(timing)
         out.extend(text_lines)
         out.append("")
     return "\n".join(out)
@@ -295,6 +363,7 @@ class Occurrence:
     text: str       # 原字幕正文
     kind: str
     signature: str
+    settings: str = ""  # 对应原字幕的时间行设置（--> 之后的部分）
 
     @property
     def original_range(self) -> tuple[int, int]:
@@ -374,6 +443,7 @@ def compute_occurrences(cuts: list[Cut], cues: list[Cue]) -> list[Fragment]:
                     signature=make_signature(
                         fragment.fragment_no, cue.text, ov_start, ov_end
                     ),
+                    settings=cue.settings,
                 )
             )
     return fragments
@@ -414,14 +484,46 @@ def pending_occurrences(
     return [occ for occ in flatten(fragments) if is_pending(occ, decisions)]
 
 
-def build_output(fragments: list[Fragment], decisions: dict[str, dict]) -> str:
-    entries: list[tuple[int, int, list[str]]] = []
+def build_output(
+    fragments: list[Fragment],
+    decisions: dict[str, dict],
+    regions: Optional[dict[str, list[str]]] = None,
+) -> str:
+    """拼出成品 WebVTT。
+
+    每条输出字幕保留其对应原字幕的时间行设置；文件头只收录输出字幕
+    实际引用的 REGION 定义（未引用的定义不带走，未定义的引用无块可收）。
+    """
+    entries: list[tuple] = []
+    referenced: list[str] = []
     for occ in flatten(fragments):
         lines = decision_text(occ, decisions)
         if not lines:
             continue
-        entries.append((occ.out_start, occ.out_end, lines))
-    return build_vtt(entries)
+        entries.append((occ.out_start, occ.out_end, occ.settings, lines))
+        for region_id in region_refs(occ.settings):
+            if region_id not in referenced:
+                referenced.append(region_id)
+    blocks: list[list[str]] = []
+    if regions:
+        blocks = [regions[region_id] for region_id in referenced if region_id in regions]
+    return build_vtt(entries, blocks)
+
+
+def missing_region_occurrences(
+    fragments: list[Fragment],
+    decisions: dict[str, dict],
+    regions: dict[str, list[str]],
+) -> list[tuple[Occurrence, list[str]]]:
+    """会进入成品、但引用了未定义 REGION 的字幕出现及其缺失的 id。"""
+    missing: list[tuple[Occurrence, list[str]]] = []
+    for occ in flatten(fragments):
+        if not decision_text(occ, decisions):
+            continue  # 未处理或已删除的出现不会进入成品
+        refs = [rid for rid in region_refs(occ.settings) if rid not in regions]
+        if refs:
+            missing.append((occ, refs))
+    return missing
 
 
 def inherited_decisions(
@@ -472,9 +574,19 @@ CREATE TABLE IF NOT EXISTS edition (
     total_ms INTEGER NOT NULL,
     cue_count INTEGER NOT NULL,
     source_draft_id INTEGER,
-    vtt_blob BLOB NOT NULL
+    vtt_blob BLOB NOT NULL,
+    repaired_blob BLOB,
+    repaired_sha256 TEXT,
+    repaired_at TEXT
 );
 """
+
+# 旧库补列：CREATE TABLE IF NOT EXISTS 不会更新已有表。
+_EDITION_ADDITIONS = {
+    "repaired_blob": "ALTER TABLE edition ADD COLUMN repaired_blob BLOB",
+    "repaired_sha256": "ALTER TABLE edition ADD COLUMN repaired_sha256 TEXT",
+    "repaired_at": "ALTER TABLE edition ADD COLUMN repaired_at TEXT",
+}
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -489,6 +601,10 @@ def init_db(path: str) -> None:
     conn = connect(path)
     try:
         conn.executescript(SCHEMA)
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(edition)")}
+        for name, ddl in _EDITION_ADDITIONS.items():
+            if name not in columns:
+                conn.execute(ddl)
     finally:
         conn.close()
 
@@ -597,6 +713,7 @@ def load_bundle(conn: sqlite3.Connection, draft_id: int) -> Optional[dict]:
         "cuts": cuts,
         "fragments": fragments,
         "occurrences": flatten(fragments),
+        "regions": parse_regions(row["vtt_raw"]),
         "decisions": decision_rows(conn, draft_id),
         "lock_version": current_lock,
         "stale": row["published_version"] is not None
@@ -694,18 +811,21 @@ def get_edition(conn: sqlite3.Connection, version_no: int) -> Optional[sqlite3.R
 
 
 def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> int:
-    """发布：所有剪口处理完毕才写入新版；任何失败都不留新版本。"""
+    """发布：所有剪口处理完毕、REGION 引用齐全才写入新版；任何失败都不留新版本。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = _reject_if_stale(conn, draft_id, expected_revision)
-        fragments = compute_occurrences(
-            _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
-        )
+        cues = parse_vtt(row["vtt_raw"])
+        regions = parse_regions(row["vtt_raw"])
+        fragments = compute_occurrences(_parse_cuts(row["cuts_json"]), cues)
         decisions = decision_rows(conn, draft_id)
         pending = pending_occurrences(fragments, decisions)
         if pending:
             raise PublishBlocked(pending)
-        vtt_text = build_output(fragments, decisions)
+        missing = missing_region_occurrences(fragments, decisions, regions)
+        if missing:
+            raise MissingRegions(missing)
+        vtt_text = build_output(fragments, decisions, regions)
         blob = vtt_text.encode("utf-8")
         latest = conn.execute(
             "SELECT COALESCE(MAX(version_no), 0) AS v FROM edition"
@@ -741,3 +861,89 @@ def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> 
     except Exception:
         conn.execute("ROLLBACK")
         raise
+
+
+# ---------------------------------------------------------------------------
+# 布局修复件
+# ---------------------------------------------------------------------------
+
+
+def repair_edition(conn: sqlite3.Connection, version_no: int) -> bytes:
+    """为已发布版本生成布局修复件：用发布时的源草稿重算，并逐条核对原件。
+
+    每版只留一份修复件：已生成过就直接返回库中那一份；首次生成时若来源
+    缺失、核对不符或生成失败，抛出 RepairError 说明原因，不留下修复件。
+    成功生成的修复件持久化在该版记录里，清理源草稿或重启后字节不变。
+    """
+    edition = get_edition(conn, version_no)
+    if edition is None:
+        raise RepairError(f"第 {version_no} 版不存在")
+    existing = edition["repaired_blob"]
+    if existing is not None:
+        return bytes(existing)
+
+    draft_id = edition["source_draft_id"]
+    if draft_id is None:
+        raise RepairError("该版本没有记录源草稿，无法重算布局")
+    draft = load_draft(conn, draft_id)
+    if draft is None:
+        raise RepairError("发布时的源草稿已被清理，无法重算布局")
+
+    try:
+        cues = parse_vtt(draft["vtt_raw"])
+        regions = parse_regions(draft["vtt_raw"])
+        cuts = _parse_cuts(draft["cuts_json"])
+    except (ParseError, ValueError) as exc:
+        raise RepairError(f"源草稿数据无法解析：{exc}") from exc
+    fragments = compute_occurrences(cuts, cues)
+    decisions = decision_rows(conn, draft_id)
+    repaired_text = build_output(fragments, decisions, regions)
+
+    # 核对：条数相同，且字幕按原件顺序逐条对得上节选起止和正文。
+    try:
+        original_cues = parse_vtt(edition["vtt_blob"].decode("utf-8"))
+        recomputed_cues = parse_vtt(repaired_text)
+    except ParseError as exc:
+        raise RepairError(f"重算结果无法核对：{exc}") from exc
+    if len(recomputed_cues) != len(original_cues):
+        raise RepairError(
+            f"核对不符：原件 {len(original_cues)} 条字幕，"
+            f"按源草稿重算为 {len(recomputed_cues)} 条，条数不同"
+        )
+    for pos, (original, recomputed) in enumerate(
+        zip(original_cues, recomputed_cues), 1
+    ):
+        if (original.start_ms, original.end_ms) != (
+            recomputed.start_ms,
+            recomputed.end_ms,
+        ):
+            raise RepairError(
+                f"核对不符：第 {pos} 条节选起止与原件不一致"
+                f"（原件 {format_timestamp(original.start_ms)}"
+                f"–{format_timestamp(original.end_ms)}，重算 "
+                f"{format_timestamp(recomputed.start_ms)}"
+                f"–{format_timestamp(recomputed.end_ms)}）"
+            )
+        if original.text != recomputed.text:
+            raise RepairError(f"核对不符：第 {pos} 条正文与原件不一致")
+
+    blob = repaired_text.encode("utf-8")
+    sha256 = hashlib.sha256(blob).hexdigest()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        cursor = conn.execute(
+            """
+            UPDATE edition
+            SET repaired_blob = ?, repaired_sha256 = ?, repaired_at = ?
+            WHERE version_no = ? AND repaired_blob IS NULL
+            """,
+            (blob, sha256, _utc_now(), version_no),
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    if cursor.rowcount == 0:
+        # 并发下另一请求已先写入：以库中那一份为准，保证每版只有一份。
+        return bytes(get_edition(conn, version_no)["repaired_blob"])
+    return blob
